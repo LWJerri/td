@@ -41,6 +41,7 @@ FileDownloader::FileDownloader(const FullRemoteFileLocation &remote, const Local
     , name_(std::move(name))
     , encryption_key_(encryption_key)
     , callback_(std::move(callback))
+    , streaming_mode_(false)
     , is_small_(is_small)
     , need_search_file_(need_search_file)
     , ordered_flag_(encryption_key_.is_secret())
@@ -49,6 +50,30 @@ FileDownloader::FileDownloader(const FullRemoteFileLocation &remote, const Local
   if (!encryption_key.empty()) {
     CHECK(offset_ == 0);
   }
+}
+
+FileDownloader::FileDownloader(const FullRemoteFileLocation &remote, const LocalFileLocation &local, int64 size,
+                               string name, const FileEncryptionKey &encryption_key, bool is_small,
+                               bool need_search_file, int64 offset, int64 limit, unique_ptr<Callback> callback,
+                               StreamingDataCallback streaming_callback)
+    : remote_(remote)
+    , local_(local)
+    , size_(size)
+    , name_(std::move(name))
+    , encryption_key_(encryption_key)
+    , callback_(std::move(callback))
+    , streaming_mode_(true)
+    , streaming_callback_(std::move(streaming_callback))
+    , is_small_(is_small)
+    , need_search_file_(need_search_file)
+    , ordered_flag_(encryption_key_.is_secret())
+    , offset_(offset)
+    , limit_(limit) {
+  if (!encryption_key.empty()) {
+    CHECK(offset_ == 0);
+  }
+
+  need_search_file_ = false;
 }
 
 void FileDownloader::on_error(Status status) {
@@ -284,12 +309,105 @@ Result<size_t> FileDownloader::process_part(Part part, NetQueryPtr net_query) {
   return written;
 }
 
+Result<size_t> FileDownloader::process_part_streaming(Part part, NetQueryPtr net_query) {
+  TRY_STATUS(check_net_query(net_query));
+
+  BufferSlice bytes;
+  bool need_cdn_decrypt = false;
+  auto query_type = narrow_cast<QueryType>(UniqueId::extract_key(net_query->id()));
+  switch (query_type) {
+    case QueryType::Default: {
+      if (remote_.is_web()) {
+        TRY_RESULT(file, fetch_result<telegram_api::upload_getWebFile>(std::move(net_query)));
+        bytes = std::move(file->bytes_);
+      } else {
+        TRY_RESULT(file_base, fetch_result<telegram_api::upload_getFile>(std::move(net_query)));
+        CHECK(file_base->get_id() == telegram_api::upload_file::ID);
+        auto file = move_tl_object_as<telegram_api::upload_file>(file_base);
+        LOG(DEBUG) << "Receive part " << part.id << " (streaming): " << to_string(file);
+        bytes = std::move(file->bytes_);
+      }
+      break;
+    }
+    case QueryType::CDN: {
+      TRY_RESULT(file_base, fetch_result<telegram_api::upload_getCdnFile>(std::move(net_query)));
+      CHECK(file_base->get_id() == telegram_api::upload_cdnFile::ID);
+      auto file = move_tl_object_as<telegram_api::upload_cdnFile>(file_base);
+      LOG(DEBUG) << "Receive part " << part.id << " from CDN (streaming): " << to_string(file);
+      bytes = std::move(file->bytes_);
+      need_cdn_decrypt = true;
+      break;
+    }
+    default:
+      UNREACHABLE();
+  }
+
+  auto padded_size = part.size;
+  if (encryption_key_.is_secret()) {
+    padded_size = (part.size + 15) & ~15;
+  }
+  if (bytes.size() > padded_size) {
+    return Status::Error("Part size is more than requested");
+  }
+  if (bytes.empty()) {
+    return 0;
+  }
+
+  if (need_cdn_decrypt) {
+    CHECK(part.offset % 16 == 0);
+    auto offset = narrow_cast<uint32>(part.offset / 16);
+    offset =
+        ((offset & 0xff) << 24) | ((offset & 0xff00) << 8) | ((offset & 0xff0000) >> 8) | ((offset & 0xff000000) >> 24);
+
+    AesCtrState ctr_state;
+    string iv = cdn_encryption_iv_;
+    as<uint32>(&iv[12]) = offset;
+    ctr_state.init(cdn_encryption_key_, iv);
+    ctr_state.decrypt(bytes.as_slice(), bytes.as_mutable_slice());
+  }
+  if (encryption_key_.is_secret()) {
+    LOG_CHECK(next_part_ == part.id) << tag("expected part.id", next_part_) << "!=" << tag("part.id", part.id);
+    CHECK(!next_part_stop_);
+    next_part_++;
+    if (part.size % 16 != 0) {
+      next_part_stop_ = true;
+    }
+    aes_ige_decrypt(as_slice(encryption_key_.key()), as_mutable_slice(encryption_key_.mutable_iv()), bytes.as_slice(),
+                    bytes.as_mutable_slice());
+  }
+
+  auto slice = bytes.as_slice().substr(0, part.size);
+
+  LOG(INFO) << "Streaming " << slice.size() << " bytes at offset " << part.offset;
+
+  if (streaming_callback_) {
+    TRY_STATUS(streaming_callback_(part.offset, slice));
+  }
+
+  streaming_total_size_ += slice.size();
+  return slice.size();
+}
+
 void FileDownloader::on_progress() {
   if (parts_manager_.ready()) {
     // do not send partial location. will lead to wrong local_size
     return;
   }
   auto ready_size = parts_manager_.get_ready_size();
+
+  if (streaming_mode_) {
+    if (ready_size == 0) {
+      return;
+    }
+
+    auto part_size = static_cast<int32>(parts_manager_.get_part_size());
+    auto size = parts_manager_.get_size_or_zero();
+    callback_->on_partial_download(
+        PartialLocalFileLocation{remote_.file_type_, part_size, "streaming://", "", parts_manager_.get_bitmask(), ready_size},
+        size);
+    return;
+  }
+
   if (ready_size == 0 || path_.empty()) {
     return;
   }
@@ -324,6 +442,10 @@ Status FileDownloader::process_check_query(NetQueryPtr net_query) {
 }
 
 Status FileDownloader::check_loop(int64 checked_prefix_size, int64 ready_prefix_size, bool is_ready) {
+  if (streaming_mode_) {
+    return Status::OK();
+  }
+
   if (!need_check_) {
     return Status::OK();
   }
@@ -416,6 +538,10 @@ void FileDownloader::try_release_fd() {
 }
 
 Status FileDownloader::acquire_fd() {
+  if (streaming_mode_) {
+    return Status::OK();
+  }
+
   if (fd_.empty()) {
     if (path_.empty()) {
       TRY_RESULT_ASSIGN(std::tie(fd_, path_), open_temp_file(remote_.file_type_));
@@ -488,47 +614,51 @@ void FileDownloader::start_up() {
   }
   int32 part_size = 0;
   Bitmask bitmask{Bitmask::Ones{}, 0};
-  if (local_.type() == LocalFileLocation::Type::Partial) {
-    const auto &partial = local_.partial();
-    path_ = partial.path_;
-    auto result_fd = FileFd::open(path_, FileFd::Write | FileFd::Read);
-    // TODO: check timestamps..
-    if (result_fd.is_ok()) {
-      if ((!encryption_key_.is_secret() || partial.iv_.size() == 32) && partial.part_size_ >= 0 &&
-          partial.part_size_ <= (1 << 20) && (partial.part_size_ & (partial.part_size_ - 1)) == 0) {
-        bitmask = Bitmask(Bitmask::Decode{}, partial.ready_bitmask_);
-        if (encryption_key_.is_secret()) {
-          encryption_key_.mutable_iv() = as<UInt256>(partial.iv_.data());
-          next_part_ = narrow_cast<int32>(bitmask.get_ready_parts(0));
+
+  if (!streaming_mode_) {
+    if (local_.type() == LocalFileLocation::Type::Partial) {
+      const auto &partial = local_.partial();
+      path_ = partial.path_;
+      auto result_fd = FileFd::open(path_, FileFd::Write | FileFd::Read);
+
+      // TODO: check timestamps
+      if (result_fd.is_ok()) {
+        if ((!encryption_key_.is_secret() || partial.iv_.size() == 32) && partial.part_size_ >= 0 &&
+            partial.part_size_ <= (1 << 20) && (partial.part_size_ & (partial.part_size_ - 1)) == 0) {
+          bitmask = Bitmask(Bitmask::Decode{}, partial.ready_bitmask_);
+          if (encryption_key_.is_secret()) {
+            encryption_key_.mutable_iv() = as<UInt256>(partial.iv_.data());
+            next_part_ = narrow_cast<int32>(bitmask.get_ready_parts(0));
+          }
+          fd_ = result_fd.move_as_ok();
+          part_size = static_cast<int32>(partial.part_size_);
+        } else {
+          LOG(ERROR) << "Have invalid " << partial;
         }
-        fd_ = result_fd.move_as_ok();
-        part_size = static_cast<int32>(partial.part_size_);
-      } else {
-        LOG(ERROR) << "Have invalid " << partial;
       }
     }
-  }
-  if (need_search_file_ && fd_.empty() && size_ > 0 && encryption_key_.empty() && !remote_.is_web()) {
-    auto r_path = search_file(remote_.file_type_, name_, size_);
-    if (r_path.is_ok()) {
-      auto r_fd = FileFd::open(r_path.ok(), FileFd::Read);
-      if (r_fd.is_ok()) {
-        path_ = r_path.move_as_ok();
-        fd_ = r_fd.move_as_ok();
-        need_check_ = true;
-        only_check_ = true;
-        part_size = 128 * (1 << 10);
-        bitmask = Bitmask{Bitmask::Ones{}, (size_ + part_size - 1) / part_size};
-        LOG(INFO) << "Check hash of local file " << path_;
+    if (need_search_file_ && fd_.empty() && size_ > 0 && encryption_key_.empty() && !remote_.is_web()) {
+      auto r_path = search_file(remote_.file_type_, name_, size_);
+      if (r_path.is_ok()) {
+        auto r_fd = FileFd::open(r_path.ok(), FileFd::Read);
+        if (r_fd.is_ok()) {
+          path_ = r_path.move_as_ok();
+          fd_ = r_fd.move_as_ok();
+          need_check_ = true;
+          only_check_ = true;
+          part_size = 128 * (1 << 10);
+          bitmask = Bitmask{Bitmask::Ones{}, (size_ + part_size - 1) / part_size};
+          LOG(INFO) << "Check hash of local file " << path_;
+        }
       }
     }
+    try_release_fd();
   }
-  try_release_fd();
 
   auto ready_parts = bitmask.as_vector();
   auto status = parts_manager_.init(size_, size_, true, part_size, ready_parts, false, false);
   LOG(DEBUG) << "Start downloading a file of size " << size_ << ", part size " << part_size << " and "
-             << ready_parts.size() << " ready parts: " << status;
+             << ready_parts.size() << " ready parts" << (streaming_mode_ ? " (streaming mode)" : "") << ": " << status;
   if (status.is_error()) {
     return on_error(std::move(status));
   }
@@ -576,6 +706,15 @@ Status FileDownloader::do_loop() {
     TRY_STATUS(parts_manager_.finish());
     fd_.close();
     auto size = parts_manager_.get_size();
+
+    if (streaming_mode_) {
+      LOG(INFO) << "Streaming download completed, total size: " << streaming_total_size_;
+
+      callback_->on_ok(FullLocalFileLocation(remote_.file_type_, "streaming://complete", 0), size, true);
+      stop_flag_ = true;
+      return Status::OK();
+    }
+
     if (encryption_key_.is_secure()) {
       TRY_RESULT(file_path, open_temp_file(remote_.file_type_));
       string tmp_path;
@@ -724,8 +863,15 @@ void FileDownloader::on_part_query(Part part, NetQueryPtr query) {
 }
 
 Status FileDownloader::try_on_part_query(Part part, NetQueryPtr query) {
-  TRY_RESULT(size, process_part(part, std::move(query)));
-  VLOG(file_loader) << "Ok part " << tag("id", part.id) << tag("size", part.size);
+  Result<size_t> size_result;
+  if (streaming_mode_) {
+    size_result = process_part_streaming(part, std::move(query));
+  } else {
+    size_result = process_part(part, std::move(query));
+  }
+  TRY_RESULT(size, std::move(size_result));
+
+  VLOG(file_loader) << "Ok part " << tag("id", part.id) << tag("size", part.size) << (streaming_mode_ ? " (streaming)" : "");
   resource_state_.stop_use(static_cast<int64>(part.size));
   auto old_ready_prefix_count = parts_manager_.get_unchecked_ready_prefix_count();
   TRY_STATUS(parts_manager_.on_part_ok(part.id, part.size, size));

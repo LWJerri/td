@@ -19,16 +19,20 @@
 
 #include "td/actor/actor.h"
 
+#include "td/utils/buffer.h"
 #include "td/utils/common.h"
 #include "td/utils/OrderedEventsProcessor.h"
 #include "td/utils/port/FileFd.h"
 #include "td/utils/Status.h"
 
+#include <functional>
 #include <map>
 #include <set>
 #include <utility>
 
 namespace td {
+
+using StreamingDataCallback = std::function<Status(int64 offset, Slice data)>;
 
 class FileDownloader final : public FileLoaderActor {
  public:
@@ -48,7 +52,15 @@ class FileDownloader final : public FileLoaderActor {
                  const FileEncryptionKey &encryption_key, bool is_small, bool need_search_file, int64 offset,
                  int64 limit, unique_ptr<Callback> callback);
 
+  FileDownloader(const FullRemoteFileLocation &remote, const LocalFileLocation &local, int64 size, string name,
+                 const FileEncryptionKey &encryption_key, bool is_small, bool need_search_file, int64 offset,
+                 int64 limit, unique_ptr<Callback> callback, StreamingDataCallback streaming_callback);
+
   void update_downloaded_part(int64 offset, int64 limit, int64 max_resource_limit);
+
+  bool is_streaming_mode() const {
+    return streaming_mode_;
+  }
 
   // Should just implement all parent pure virtual methods.
   // Must not call any of them...
@@ -64,6 +76,10 @@ class FileDownloader final : public FileLoaderActor {
 
   string path_;
   FileFd fd_;
+
+  bool streaming_mode_{false};
+  StreamingDataCallback streaming_callback_;
+  int64 streaming_total_size_{0};
 
   int32 next_part_ = 0;
   bool next_part_stop_ = false;
@@ -124,6 +140,8 @@ class FileDownloader final : public FileLoaderActor {
   Result<NetQueryPtr> start_part(Part part, int32 part_count, int64 streaming_offset) TD_WARN_UNUSED_RESULT;
 
   Result<size_t> process_part(Part part, NetQueryPtr net_query) TD_WARN_UNUSED_RESULT;
+
+  Result<size_t> process_part_streaming(Part part, NetQueryPtr net_query) TD_WARN_UNUSED_RESULT;
 
   void add_hash_info(const std::vector<telegram_api::object_ptr<telegram_api::fileHash>> &hashes);
 

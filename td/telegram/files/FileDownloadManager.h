@@ -21,6 +21,7 @@
 #include "td/utils/Container.h"
 #include "td/utils/Status.h"
 
+#include <functional>
 #include <map>
 
 namespace td {
@@ -43,6 +44,10 @@ class FileDownloadManager final : public Actor {
   void download(QueryId query_id, const FullRemoteFileLocation &remote_location, const LocalFileLocation &local,
                 int64 size, string name, const FileEncryptionKey &encryption_key, bool need_search_file, int64 offset,
                 int64 limit, int8 priority);
+
+  void download_streaming(QueryId query_id, const FullRemoteFileLocation &remote_location, const LocalFileLocation &local,
+                          int64 size, string name, const FileEncryptionKey &encryption_key, bool need_search_file,
+                          int64 offset, int64 limit, int8 priority, StreamingDataCallback streaming_callback);
 
   void update_priority(QueryId query_id, int8 priority);
 
