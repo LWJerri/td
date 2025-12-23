@@ -61,6 +61,34 @@ void FileDownloadManager::download(QueryId query_id, const FullRemoteFileLocatio
   CHECK(is_inserted);
 }
 
+void FileDownloadManager::download_streaming(QueryId query_id, const FullRemoteFileLocation &remote_location,
+                                              const LocalFileLocation &local, int64 size, string name,
+                                              const FileEncryptionKey &encryption_key, bool need_search_file,
+                                              int64 offset, int64 limit, int8 priority,
+                                              StreamingDataCallback streaming_callback) {
+  if (stop_flag_) {
+    return;
+  }
+  NodeId node_id = nodes_container_.create(Node());
+  Node *node = nodes_container_.get(node_id);
+  CHECK(node);
+  node->query_id_ = query_id;
+  auto callback = make_unique<FileDownloaderCallback>(actor_shared(this, node_id));
+  bool is_small = size < 20 * 1024;
+
+  node->downloader_ =
+      create_actor<FileDownloader>("StreamingDownloader", remote_location, local, size, std::move(name), encryption_key,
+                                   is_small, need_search_file, offset, limit, std::move(callback),
+                                   std::move(streaming_callback));
+
+  DcId dc_id = remote_location.is_web() ? G()->get_webfile_dc_id() : remote_location.get_dc_id();
+  auto &resource_manager = get_download_resource_manager(is_small, dc_id);
+  send_closure(resource_manager, &ResourceManager::register_worker,
+               ActorShared<FileLoaderActor>(node->downloader_.get(), static_cast<uint64>(-1)), priority);
+  bool is_inserted = query_id_to_node_id_.emplace(query_id, node_id).second;
+  CHECK(is_inserted);
+}
+
 void FileDownloadManager::update_priority(QueryId query_id, int8 priority) {
   if (stop_flag_) {
     return;
